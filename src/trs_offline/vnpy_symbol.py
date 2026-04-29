@@ -54,6 +54,8 @@ def guess_next_trading_date(rqdatac, base_date: date) -> date:
 def fetch_dominant_vt_symbol(rqdatac, product: str, exchange: str, trading_date: date) -> str:
     p = product.upper()
     series = rqdatac.futures.get_dominant(p, trading_date)
+    if series is None or len(series) == 0:
+        return ""
     code = str(series.values[0])
     return dominant_to_vt_symbol(code, exchange)
 
