@@ -1,0 +1,49 @@
+{
+  "TRS_RB": {
+    "class_name": "TripleRsiLongShortStrategy",
+    "vt_symbol": "rb888.SHFE",
+    "setting": {
+      "rsi_period": 5,
+      "ma_period": 200,
+      "allow_long_entry": 1,
+      "allow_short_entry": 1,
+      "use_external_filter": 1,
+      "external_filter_strict": 1,
+      "external_filter_check_date": 0,
+      "rsi_entry_long": 30,
+      "rsi_exit_long": 50,
+      "rsi_prev_threshold_long": 60,
+      "rsi_entry_short": 70,
+      "rsi_exit_short": 50,
+      "rsi_prev_threshold_short": 40,
+      "fixed_size": 1,
+      "price_add_rate": 0.01
+    }
+  },
+  "PBMR_RB": {
+    "class_name": "PullbackMrStrategy",
+    "vt_symbol": "rb888.SHFE",
+    "setting": {
+      "sma_200_period": 200,
+      "sma_20_period": 20,
+      "rsi_period": 5,
+      "rsi_entry": 45,
+      "rsi_exit": 65,
+      "fixed_size": 1,
+      "price_add_rate": 0.01
+    }
+  },
+  "PBMR_AU": {
+    "class_name": "PullbackMrStrategy",
+    "vt_symbol": "AU888.SHFE",
+    "setting": {
+      "sma_200_period": 140,
+      "sma_20_period": 18,
+      "rsi_period": 5,
+      "rsi_entry": 31,
+      "rsi_exit": 72,
+      "fixed_size": 1,
+      "price_add_rate": 0.01
+    }
+  }
+}
