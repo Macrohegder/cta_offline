@@ -22,7 +22,7 @@ if not exist "%SCRIPT_DIR%\..\output\targets_prev.json" (
   echo using --allow-initial (treat prev target as 0)
   "%PYTHON_EXE%" "%SCRIPT_DIR%\generate_orders_csv.py" --algo BestLimitAlgo --min-volume 1 --max-volume 1 --allow-initial %FILTER_ARGS%
   if errorlevel 1 exit /b %ERRORLEVEL%
-  if not exist "%PROJECT_ROOT%\output\algotrading_TwapAlgo_latest.csv" (
+  if not exist "%PROJECT_ROOT%\output\algotrading_BestLimitAlgo_latest.csv" (
     echo ERROR: expected output not found: "%PROJECT_ROOT%\output\algotrading_BestLimitAlgo_latest.csv"
     exit /b 1
   )

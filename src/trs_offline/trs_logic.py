@@ -61,6 +61,48 @@ def calculate_sma(values: list[float], period: int) -> float:
     return float(sum(window) / period)
 
 
+def calculate_true_range_series(highs: list[float], lows: list[float], closes: list[float]) -> list[float]:
+    n = min(len(highs), len(lows), len(closes))
+    if n == 0:
+        return []
+    out: list[float] = []
+    prev_close = float(closes[0])
+    for i in range(n):
+        high = float(highs[i])
+        low = float(lows[i])
+        close = float(closes[i])
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        out.append(float(tr))
+        prev_close = close
+    return out
+
+
+def calculate_atr_wilder(highs: list[float], lows: list[float], closes: list[float], period: int) -> float:
+    series = calculate_atr_wilder_series(highs, lows, closes, period)
+    return float(series[-1]) if series else 0.0
+
+
+def calculate_atr_wilder_series(
+    highs: list[float], lows: list[float], closes: list[float], period: int
+) -> list[float]:
+    n = int(period)
+    length = min(len(highs), len(lows), len(closes))
+    if n <= 0 or length < n + 1:
+        return [0.0 for _ in range(length)]
+
+    tr = calculate_true_range_series(highs[:length], lows[:length], closes[:length])
+    out = [0.0 for _ in range(length)]
+
+    atr = sum(tr[1 : n + 1]) / n
+    out[n] = float(atr)
+
+    for i in range(n + 1, length):
+        atr = (atr * (n - 1) + tr[i]) / n
+        out[i] = float(atr)
+
+    return out
+
+
 def compute_pullback_mr_target_from_history(
     closes: list[float],
     sma_200_period: int,

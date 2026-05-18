@@ -183,6 +183,13 @@ def build_order_rows(
     rows: list[dict[str, Any]] = []
     products = sorted(set(now.keys()) | set(prev.keys()))
 
+    def _is_888_symbol(vt_symbol: str) -> bool:
+        s = str(vt_symbol or "").strip()
+        if not s or "." not in s:
+            return False
+        base = s.split(".", 1)[0]
+        return base.upper().endswith("888")
+
     for product in products:
         if include and product not in include:
             continue
@@ -198,6 +205,11 @@ def build_order_rows(
 
         if not now_symbol and not prev_symbol:
             continue
+
+        if prev_symbol and _is_888_symbol(prev_symbol) and now_symbol and not _is_888_symbol(now_symbol):
+            prev_symbol = now_symbol
+        if now_symbol and _is_888_symbol(now_symbol) and prev_symbol and not _is_888_symbol(prev_symbol):
+            now_symbol = prev_symbol
 
         if prev_symbol and now_symbol and prev_symbol != now_symbol:
             rows.extend(

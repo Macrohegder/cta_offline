@@ -12,10 +12,22 @@ from trs_offline.io_utils import read_json, write_csv, write_json_atomic
 from trs_offline.paths import get_default_paths
 from trs_offline.rqdatac_client import init_rqdatac
 from trs_offline.trs_logic import (
+    calculate_atr_wilder,
     compute_pullback_mr_target_from_history,
     compute_target_from_history,
 )
 from trs_offline.vnpy_symbol import fetch_dominant_vt_symbol, guess_next_trading_date, parse_vt_symbol
+
+
+CZCE_CONTRACT_MULTIPLIER_FALLBACK: dict[str, float] = {
+    "AP": 10.0,
+    "CF": 5.0,
+    "CJ": 5.0,
+    "CY": 5.0,
+    "FG": 20.0,
+    "PK": 5.0,
+    "UR": 20.0,
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -48,31 +60,106 @@ def parse_day(value: str) -> date:
     return datetime.strptime(value, "%Y-%m-%d").date()
 
 
-def fetch_daily_closes(rqdatac, order_book_id: str, start_date: date, end_date: date) -> tuple[list[float], str]:
+def get_contract_multiplier(rqdatac, order_book_id: str, exchange: str = "") -> tuple[float, bool]:
+    candidates = [
+        "contract_multiplier",
+        "contract_size",
+        "multiplier",
+        "contract_unit",
+        "trading_unit",
+        "size",
+    ]
+
+    keys_to_try: list[str] = []
+    oid = str(order_book_id or "").strip()
+    ex = str(exchange or "").strip().upper()
+    if oid:
+        keys_to_try.extend([oid, oid.upper()])
+        if ex and "." not in oid:
+            keys_to_try.extend([f"{oid.upper()}.{ex}", f"{oid}.{ex}"])
+
+    seen: set[str] = set()
+    for instrument_key in keys_to_try:
+        k = instrument_key.strip()
+        if not k or k in seen:
+            continue
+        seen.add(k)
+
+        try:
+            inst = rqdatac.instruments(k)
+        except Exception:
+            continue
+
+        for key in candidates:
+            try:
+                val = getattr(inst, key, None)
+            except Exception:
+                val = None
+            if isinstance(val, (int, float)) and float(val) > 0:
+                return float(val), True
+
+        for method in ["to_dict", "as_dict", "dict"]:
+            fn = getattr(inst, method, None)
+            if not callable(fn):
+                continue
+            try:
+                payload = fn()
+            except Exception:
+                payload = None
+            if isinstance(payload, dict):
+                for key in candidates:
+                    val = payload.get(key)
+                    if isinstance(val, (int, float)) and float(val) > 0:
+                        return float(val), True
+
+    return 0.0, False
+
+
+def compute_atr_position_size(
+    atr_value: float,
+    contract_multiplier: float,
+    *,
+    base_capital: float,
+    risk_rate: float,
+    min_size: int,
+) -> int:
+    if atr_value <= 0 or contract_multiplier <= 0:
+        return int(min_size)
+    risk_capital = float(base_capital) * float(risk_rate)
+    raw = risk_capital / (float(atr_value) * float(contract_multiplier))
+    size = int(raw + 0.5)
+    return max(int(min_size), int(size))
+
+
+def fetch_daily_bars(
+    rqdatac, order_book_id: str, start_date: date, end_date: date
+) -> tuple[list[float], list[float], list[float], str]:
     data = rqdatac.get_price(
         order_book_ids=order_book_id,
         start_date=start_date,
         end_date=end_date,
         frequency="1d",
-        fields=["close"],
+        fields=["high", "low", "close"],
     )
     if data is None or len(data) == 0:
-        return [], ""
+        return [], [], [], ""
 
-    if hasattr(data, "columns") and "close" in data.columns:
-        series = data["close"]
+    if hasattr(data, "columns") and all(col in data.columns for col in ["high", "low", "close"]):
+        df = data[["high", "low", "close"]]
     else:
-        series = data.squeeze()
+        df = data
 
-    series = series.dropna()
-    if len(series) == 0:
-        return [], ""
+    df = df.dropna()
+    if len(df) == 0:
+        return [], [], [], ""
 
-    closes = [float(v) for v in series.tolist()]
-    last_index = series.index[-1]
+    highs = [float(v) for v in df["high"].tolist()]
+    lows = [float(v) for v in df["low"].tolist()]
+    closes = [float(v) for v in df["close"].tolist()]
+    last_index = df.index[-1]
     index_value = last_index[-1] if isinstance(last_index, tuple) and last_index else last_index
     trade_date = index_value.date().isoformat() if hasattr(index_value, "date") else str(index_value)[:10]
-    return closes, trade_date
+    return highs, lows, closes, trade_date
 
 
 def main() -> int:
@@ -127,7 +214,7 @@ def main() -> int:
         lookback_days = max(max_needed * 3, max_needed + 90)
         start_date = requested_end_date - timedelta(days=lookback_days)
 
-        closes, trade_date_str = fetch_daily_closes(rqdatac, order_book_id, start_date, requested_end_date)
+        highs, lows, closes, trade_date_str = fetch_daily_bars(rqdatac, order_book_id, start_date, requested_end_date)
         signal_date = date.fromisoformat(trade_date_str) if trade_date_str else None
 
         effective_allow_long = ""
@@ -135,7 +222,64 @@ def main() -> int:
         snapshot: dict[str, Any] = {}
 
         fixed_size = int(stg_setting.get("fixed_size", 1))
+        atr_period = int(stg_setting.get("atr_period", 14))
+        sizing_base_capital = float(stg_setting.get("sizing_base_capital", 10_000_000))
+        sizing_risk_rate = float(stg_setting.get("sizing_risk_rate", 0.0005))
+        sizing_min_size = int(stg_setting.get("sizing_min_size", 1))
         price_add_rate = float(stg_setting.get("price_add_rate", 0.01))
+
+        atr_value = calculate_atr_wilder(highs, lows, closes, atr_period) if highs and lows and closes else 0.0
+
+        exec_date = requested_exec_date
+        if exec_date is None and signal_date is not None:
+            exec_date = guess_next_trading_date(rqdatac, signal_date)
+
+        dominant_vt_symbol = ""
+        for d in [exec_date, signal_date]:
+            if d is None:
+                continue
+            try:
+                dominant_vt_symbol = fetch_dominant_vt_symbol(rqdatac, info.product, info.exchange, d)
+            except Exception:
+                dominant_vt_symbol = ""
+            if dominant_vt_symbol:
+                break
+
+        dominant_order_book_id = dominant_vt_symbol.split(".", 1)[0].upper() if dominant_vt_symbol else ""
+        dominant_exchange = (
+            dominant_vt_symbol.split(".", 1)[1].upper() if dominant_vt_symbol and "." in dominant_vt_symbol else str(info.exchange).upper()
+        )
+        contract_multiplier = 0.0
+        contract_multiplier_ready = False
+        if dominant_order_book_id:
+            contract_multiplier, contract_multiplier_ready = get_contract_multiplier(
+                rqdatac, dominant_order_book_id, exchange=dominant_exchange
+            )
+        if not contract_multiplier_ready:
+            try:
+                override = float(stg_setting.get("contract_multiplier_override", 0.0))
+            except Exception:
+                override = 0.0
+            if override > 0:
+                contract_multiplier = float(override)
+                contract_multiplier_ready = True
+            elif dominant_exchange == "CZCE":
+                fallback = CZCE_CONTRACT_MULTIPLIER_FALLBACK.get(info.product.upper(), 0.0)
+                if fallback > 0:
+                    contract_multiplier = float(fallback)
+                    contract_multiplier_ready = True
+
+        effective_size = fixed_size
+        sizing_used = 0
+        if contract_multiplier_ready and atr_value > 0:
+            effective_size = compute_atr_position_size(
+                atr_value,
+                contract_multiplier,
+                base_capital=sizing_base_capital,
+                risk_rate=sizing_risk_rate,
+                min_size=sizing_min_size,
+            )
+            sizing_used = 1
 
         if class_name == "TripleRsiLongShortStrategy":
             rsi_period = int(stg_setting.get("rsi_period", 5))
@@ -157,7 +301,7 @@ def main() -> int:
                 rsi_entry_short=rsi_entry_short,
                 rsi_exit_short=rsi_exit_short,
                 rsi_prev_threshold_short=rsi_prev_threshold_short,
-                fixed_size=fixed_size,
+                fixed_size=effective_size,
             )
             effective_allow_long = int(snapshot.get("allow_long") or 0) if snapshot.get("status") == "ok" else ""
             effective_allow_short = int(snapshot.get("allow_short") or 0) if snapshot.get("status") == "ok" else ""
@@ -175,20 +319,8 @@ def main() -> int:
                 rsi_period=rsi_period,
                 rsi_entry=rsi_entry,
                 rsi_exit=rsi_exit,
-                fixed_size=fixed_size,
+                fixed_size=effective_size,
             )
-
-        exec_date = requested_exec_date
-        if exec_date is None and signal_date is not None:
-            exec_date = guess_next_trading_date(rqdatac, signal_date)
-
-        dominant_vt_symbol = ""
-        if exec_date is not None:
-            try:
-                dominant_vt_symbol = fetch_dominant_vt_symbol(rqdatac, info.product, info.exchange, exec_date)
-            except Exception:
-                dominant_vt_symbol = ""
-
         record: dict[str, Any] = {
             "strategy_name": strategy_name,
             "class_name": class_name,
@@ -199,7 +331,17 @@ def main() -> int:
             "signal_date": signal_date.isoformat() if signal_date else "",
             "exec_date": exec_date.isoformat() if exec_date else "",
             "dominant_vt_symbol": dominant_vt_symbol,
+            "dominant_order_book_id": dominant_order_book_id,
             "fixed_size": fixed_size,
+            "effective_size": int(effective_size),
+            "atr_period": int(atr_period),
+            "atr_value": float(atr_value),
+            "contract_multiplier": float(contract_multiplier) if contract_multiplier_ready else 0.0,
+            "contract_multiplier_ready": int(contract_multiplier_ready),
+            "sizing_used": int(sizing_used),
+            "sizing_base_capital": float(sizing_base_capital),
+            "sizing_risk_rate": float(sizing_risk_rate),
+            "sizing_min_size": int(sizing_min_size),
             "price_add_rate": price_add_rate,
             "params": dict(stg_setting),
             "external_filter": {},
@@ -238,6 +380,9 @@ def main() -> int:
                 "signal_date": record["signal_date"],
                 "exec_date": record["exec_date"],
                 "dominant_vt_symbol": dominant_vt_symbol,
+                "effective_size": record["effective_size"],
+                "atr_value": record["atr_value"],
+                "contract_multiplier": record["contract_multiplier"],
                 "target": record["target"],
                 "status": record["status"],
                 "price_add_rate": price_add_rate,
@@ -251,6 +396,9 @@ def main() -> int:
                     "signal_date": record["signal_date"],
                     "exec_date": record["exec_date"],
                     "dominant_vt_symbol": dominant_vt_symbol,
+                    "effective_size": record["effective_size"],
+                    "atr_value": record["atr_value"],
+                    "contract_multiplier": record["contract_multiplier"],
                     "target": record["target"],
                     "status": record["status"],
                     "close": record.get("close"),
@@ -271,6 +419,9 @@ def main() -> int:
                     "signal_date": record["signal_date"],
                     "exec_date": record["exec_date"],
                     "dominant_vt_symbol": dominant_vt_symbol,
+                    "effective_size": record["effective_size"],
+                    "atr_value": record["atr_value"],
+                    "contract_multiplier": record["contract_multiplier"],
                     "target": record["target"],
                     "status": record["status"],
                     "close": record.get("close"),
@@ -314,12 +465,26 @@ def main() -> int:
                 "signal_date": str(rec.get("signal_date") or ""),
                 "exec_date": str(rec.get("exec_date") or ""),
                 "fixed_size": "",
+                "effective_size": rec.get("effective_size", ""),
+                "atr_value": rec.get("atr_value", ""),
+                "contract_multiplier": rec.get("contract_multiplier", ""),
+                "sizing_base_capital": rec.get("sizing_base_capital", ""),
+                "sizing_risk_rate": rec.get("sizing_risk_rate", ""),
+                "sizing_used": rec.get("sizing_used", ""),
                 "price_add_rate": float(rec.get("price_add_rate") or 0.01),
                 "status": "ok",
                 "target": 0,
                 "components": [],
             }
             by_product[product] = slot
+        else:
+            try:
+                s0 = int(slot.get("effective_size") or 0)
+                s1 = int(rec.get("effective_size") or 0)
+                if s1 > s0:
+                    slot["effective_size"] = int(s1)
+            except Exception:
+                pass
 
         slot["target"] = int(slot.get("target", 0)) + int(rec.get("target") or 0)
         slot["components"].append(
@@ -399,6 +564,9 @@ def main() -> int:
             "signal_date",
             "exec_date",
             "dominant_vt_symbol",
+            "effective_size",
+            "atr_value",
+            "contract_multiplier",
             "target",
             "status",
             "price_add_rate",
@@ -414,6 +582,9 @@ def main() -> int:
             "signal_date",
             "exec_date",
             "dominant_vt_symbol",
+            "effective_size",
+            "atr_value",
+            "contract_multiplier",
             "target",
             "status",
             "price_add_rate",
@@ -428,6 +599,9 @@ def main() -> int:
             "signal_date",
             "exec_date",
             "dominant_vt_symbol",
+            "effective_size",
+            "atr_value",
+            "contract_multiplier",
             "target",
             "status",
             "close",
@@ -449,6 +623,9 @@ def main() -> int:
             "signal_date",
             "exec_date",
             "dominant_vt_symbol",
+            "effective_size",
+            "atr_value",
+            "contract_multiplier",
             "target",
             "status",
             "close",
@@ -470,6 +647,9 @@ def main() -> int:
             "signal_date",
             "exec_date",
             "dominant_vt_symbol",
+            "effective_size",
+            "atr_value",
+            "contract_multiplier",
             "target",
             "status",
             "close",
@@ -488,6 +668,9 @@ def main() -> int:
             "signal_date",
             "exec_date",
             "dominant_vt_symbol",
+            "effective_size",
+            "atr_value",
+            "contract_multiplier",
             "target",
             "status",
             "close",
